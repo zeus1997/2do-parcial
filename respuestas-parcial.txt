@@ -1,0 +1,1070 @@
+JORNADAS DEL SUR - ANALISIS DE ERRORES Y RENDIMIENTO
+====================================================
+Proyecto: rn/Jornadas (React Native 0.76 + TypeScript + axios + react-native-sqlite-storage)
+Revision de los problemas detectados y propuesta de correccion para los
+pedidos 41 a 44 del README. El proyecto analizado utiliza React Native y axios,
+aunque el enunciado menciona Android nativo y Retrofit.
+
+
+####################################################################
+PARTE 1 - DIAGNOSTICO
+####################################################################
+
+A. ERRORES DE DATOS (SQLite)
+----------------------------
+
+A1. Se pierden las favoritas al sincronizar
+    Ubicacion: src/data/archivo.ts:24
+    Problema:  INSERT OR REPLACE INTO charlas VALUES (...,0). En SQLite, REPLACE
+               BORRA la fila y la vuelve a insertar con favorita = 0. Cada
+               descarga vacia la agenda personal.
+    Solucion:  UPDATE de los campos del programa (sin tocar favorita) + INSERT OR
+               IGNORE para las charlas nuevas. No usar UPSERT (ON CONFLICT DO
+               UPDATE): requiere SQLite >= 3.24 y Android 8 (API 26) trae 3.18.
+
+A2. Las charlas retiradas no se borran
+    Ubicacion: src/data/archivo.ts, funcion guardar
+    Problema:  Solo inserta, nunca elimina. Si el servidor manda la lista completa
+               y una charla ya no esta, queda igual en la base, en el catalogo y
+               en "Mi agenda". Si manda una lista vacia, no cambia nada.
+    Solucion:  En la misma transaccion: DELETE FROM charlas WHERE id NOT IN (...),
+               o DELETE FROM charlas si la lista esta vacia. De paso, una charla
+               que se retira y vuelve entra sin marcar.
+
+A3. No se valida la respuesta
+    Ubicacion: src/data/AgendaRepository.ts
+    Problema:  guardar(respuesta.data) sin control. Si data es undefined o no es
+               un array, revienta dentro de la transaccion y se informa como
+               "falta de senal".
+    Solucion:  Comprobar Array.isArray(data) y los campos minimos antes de guardar.
+
+A4. No se sabe si alguna vez se descargo el programa
+    Ubicacion: src/data/archivo.ts / src/ui/programaModel.ts
+    Problema:  Una lista vacia puede ser "nunca descargue" o "el programa valido
+               esta vacio". El codigo no los distingue.
+    Solucion:  Guardar el ajuste 'edicion' = 'si' cuando la descarga sale bien.
+               Instalaciones viejas: si falta el ajuste pero hay filas, contarlo
+               como descargado.
+
+A5. No hay control de versiones del esquema
+    Ubicacion: src/data/archivo.ts (apertura de la base)
+    Problema:  Solo CREATE TABLE IF NOT EXISTS. No hay PRAGMA user_version:
+               cualquier cambio de esquema futuro rompe las instalaciones.
+    Solucion:  Migraciones controladas por PRAGMA user_version.
+
+
+B. CONCURRENCIA
+---------------
+
+B1. recargar no evita peticiones en paralelo
+    Ubicacion: src/ui/programaModel.ts, recargar
+    Problema:  Cada toque en "Actualizar"/"Reintentar" lanza otra peticion. Una
+               respuesta lenta que llega tarde puede pisar a una mas nueva (gana
+               la ultima en llegar, no la ultima pedida).
+    Solucion:  Una sola peticion a la vez. Los toques durante una peticion
+               encolan UNA peticion mas (no importa cuantos toques), que corre al
+               terminar la actual. Asi se cumple "dos toques durante una peticion
+               agregan un intento" (README 44) y la peticion extra captura la
+               edicion y disponibilidad vigentes al comenzar.
+
+B2. cargando se apaga antes de tiempo
+    Ubicacion: src/ui/programaModel.ts:29
+    Problema:  La primera peticion que termina pone cargando:false aunque otra
+               siga corriendo.
+    Solucion:  Se arregla con B1.
+
+B3. El catch se traga el error
+    Ubicacion: src/ui/programaModel.ts:26
+    Problema:  catch {} sin variable: no hay log y un error de programacion (A3)
+               se muestra como "sin conexion".
+    Solucion:  Capturar el error, registrarlo y separar error de red de error de
+               datos.
+
+B4. Marcas cambiadas durante una peticion
+    Problema:  Hoy el REPLACE pisa la marca que el usuario cambio mientras la
+               peticion estaba en vuelo.
+    Solucion:  Con A1, favorita nunca se escribe desde la respuesta. Ademas, en la
+               UI, un mapa de marcas pendientes evita que el listar() posterior a
+               la sincronizacion pise la actualizacion optimista si se ejecuta
+               antes que el UPDATE de la marca.
+
+
+C. ESTADO Y CICLO DE VIDA (React / Android)
+-------------------------------------------
+
+C1. El aviso de error tapa los datos
+    Ubicacion: src/ui/Catalogo.tsx:17
+    Problema:  aviso ? <aviso> : <Lista>. Si falla la red desaparece la lista
+               aunque haya datos guardados.
+    Solucion:  Mostrar aviso Y lista. "Reintentar" solo si no hay descarga previa
+               (A4). Descarga exitosa pero vacia: «sin charlas programadas» (texto
+               exacto del README). El aviso va en Portada (debajo del titulo) para
+               que se vea tambien en el detalle y en "Mi agenda".
+
+C2. El filtro de tema es estado local que se pierde
+    Ubicacion: src/ui/Catalogo.tsx:8
+    Problema:  useState('Todos') se pierde cada vez que Catalogo se desmonta: al
+               abrir una ficha y al cambiar de pestana.
+    Solucion:  Pasar tema al store, como dia.
+
+C3. Al rotar se desmonta el catalogo a proposito
+    Ubicacion: App.tsx:46
+    Problema:  key={width>height?'horizontal':'vertical'}. La Activity ya maneja
+               la rotacion con configChanges; este key fuerza un remontaje: se
+               pierde el estado y se dispara otra descarga.
+    Solucion:  Sacar el key.
+
+C4. El estado no sobrevive a que Android mate el proceso
+    Problema:  La ficha abierta (id), la seccion y los filtros viven en memoria.
+    Solucion:  MainActivity ya genera taskKey y lo conserva en
+               savedInstanceState, pero el JS no lo usa (App.tsx:9). Persistir la
+               vista en 'ajustes' con clave vista:<taskKey> y restaurarla al
+               iniciar.
+
+C5. Una tarea nueva hereda los filtros
+    Ubicacion: src/ui/programaModel.ts:6
+    Problema:  'estado' es variable de modulo. Si el proceso sigue vivo y se abre
+               una tarea nueva, arranca con el dia anterior.
+    Solucion:  Reiniciar la vista segun el taskKey.
+
+C6. Flag de arranque sin servicio
+    Ubicacion: android/app/src/main/java/ar/jornadasrn/MainActivity.kt:28
+    Problema:  Lee el extra sin_servicio, pero el README arranca con
+               --ez servicio_disponible false (otro nombre y logica invertida),
+               asi que el arranque sin senal nunca se activa. Ademas lo vuelve a
+               aplicar cuando Android recrea la Activity con el mismo intent.
+    Solucion:  Leer servicio_disponible (manteniendo sin_servicio por
+               compatibilidad) y aplicarlo solo si savedInstanceState == null.
+
+C7. El contador de Mesa no se actualiza
+    Ubicacion: src/ui/Mesa.tsx:15
+    Problema:  solicitudes es un 'let' importado, no estado de React. Muestra el
+               valor del momento del render.
+    Solucion:  Exponerlo con suscripcion (useSyncExternalStore).
+
+
+D. RENDIMIENTO
+--------------
+
+D1. Descargas de mas
+    Ubicacion: App.tsx:25, App.tsx:26, src/ui/Catalogo.tsx:9
+    Problema:  Tres disparadores automaticos: montaje de Portada, montaje de
+               Catalogo (se repite con rotacion/ficha/pestana) y cada vuelta del
+               fondo (AppState 'active'). Solo al arrancar ya hay 2 peticiones de
+               minimo 1,4 s cada una.
+    Solucion:  Una sola carga automatica por proceso (bandera de modulo). Las
+               demas, solo cuando el usuario la pide.
+
+D2. Lista sin virtualizar
+    Ubicacion: src/ui/componentes.tsx (Lista) y ScrollView de App.tsx:39
+    Problema:  ScrollView + .map() renderiza TODAS las tarjetas de una vez. Con
+               cientos: memoria, tiempo de montaje y scroll trabado.
+    Solucion:  FlatList con keyExtractor + React.memo en la tarjeta.
+
+D3. El store hace re-renderizar todo
+    Ubicacion: src/ui/programaModel.ts:17
+    Problema:  useSyncExternalStore(suscribir, () => estado) devuelve el objeto
+               entero: cualquier publicar re-renderiza Portada, Catalogo y todas
+               las tarjetas. recargar publica 3-4 veces por peticion.
+    Solucion:  Selectores, agrupar cambios en un solo publicar y no notificar si
+               nada cambio.
+
+D4. Filtros recalculados en cada render
+    Ubicacion: src/ui/Catalogo.tsx:18, App.tsx:49
+    Problema:  charlas.filter(...) y charlas.find(...) en cada render; crean
+               arrays nuevos que rompen la memoizacion de los hijos.
+    Solucion:  useMemo con [charlas, dia, tema].
+
+D5. Funciones, arrays y estilos nuevos en cada render
+    Ubicacion: App.tsx, Catalogo.tsx, componentes.tsx
+    Problema:  Lambdas inline, arrays literales de pestanas/filtros y estilos
+               inline ({{flex:1}}, {color:...}) obligan a re-renderizar hijos.
+    Solucion:  useCallback, constantes de modulo y StyleSheet.
+
+D6. Se relee toda la tabla por cada marca
+    Ubicacion: src/ui/programaModel.ts:32 (marcar)
+    Problema:  Despues de cada toque hace SELECT * ... ORDER BY de toda la tabla.
+    Solucion:  Actualizacion optimista en memoria; la base se escribe aparte.
+
+D7. Dos lecturas completas por recarga
+    Ubicacion: src/ui/programaModel.ts (recargar)
+    Problema:  listar() antes y despues de sincronizar aunque ya este cargado.
+    Solucion:  Leer la cache solo la primera vez.
+
+D8. Tres consultas SQL en cada peticion
+    Ubicacion: src/lab/servicio.ts
+    Problema:  Lee revision, disponible y lenta de SQLite cada vez.
+    Solucion:  Cache en memoria de los ajustes.
+
+D9. Transaccion no atomica para la UI
+    Ubicacion: src/data/archivo.ts (guardar)
+    Problema:  Borrado, insercion y flag deben ir juntos o la UI puede leer un
+               estado intermedio.
+    Solucion:  Todo en una sola transaccion (ademas es mas rapido).
+
+D10. La base se abre al importar
+    Ubicacion: src/data/archivo.ts
+    Problema:  openDatabase + CREATE TABLE corren apenas se importa el modulo, en
+               el camino critico del arranque.
+    Solucion:  Apertura perezosa (la primera vez que se usa).
+
+D11. Se compila para todas las arquitecturas
+    Ubicacion: android/gradle.properties
+    Problema:  4 ABIs: build lento y APK grande.
+    Solucion:  En desarrollo compilar solo x86_64 con -PreactNativeArchitectures.
+               NO activar splits por ABI: aplican tambien a debug y cambian el
+               nombre del APK (app-x86_64-debug.apk en vez de app-debug.apk),
+               rompiendo la entrega que espera el README.
+
+D12. Release sin minificar
+    Ubicacion: android/app/build.gradle
+    Problema:  enableProguardInReleaseBuilds = false.
+    Solucion:  Activarlo con reglas keep para sqlite.
+
+D13. El APK debug no funciona sin Metro
+    Ubicacion: android/app/build.gradle (bloque react { })
+    Problema:  En React Native el APK debug no trae el JS: depende de Metro. El
+               README espera un APK instalable en app/build/outputs/apk/debug/.
+    Solucion:  debuggableVariants = [] para empaquetar el JS tambien en debug.
+
+
+E. CODIGO MUERTO O CONFUSO
+--------------------------
+- src/legacy/agendaImpresa.ts no se usa en ningun lado: codigo muerto.
+- taskKey se recibe pero no se usa (resuelto en C4).
+- strings.xml dice "Hello App Display Name" (resto del template).
+- favorita es INTEGER (0/1) y number en el tipo Charla; riesgo de mostrar un "0"
+  suelto en JSX si se usa {f.favorita && <Text/>}. Comparar siempre con === 1.
+
+
+PRIORIDAD PARA EL PARCIAL
+-------------------------
+Criticos:      A1 (favoritas), A2 (retiradas), C1 (sin senal se va la lista),
+               B1 (carreras), C6 (el arranque sin senal del README no funciona).
+Rendimiento:   D1 (descargas duplicadas, junto con el key de C3).
+Despues:       D2 y D3 (lista sin virtualizar y re-renders globales).
+
+
+
+####################################################################
+PARTE 2 - CODIGO DE CADA CORRECCION
+####################################################################
+Convencion: "ANTES" es el codigo actual, "DESPUES" el corregido.
+
+
+====================================================================
+src/data/archivo.ts   (A1, A2, A4, A5, D8, D9, D10, B4)
+====================================================================
+
+--- D10 + A5: apertura perezosa y migraciones con user_version ---
+
+ANTES:
+  SQLite.enablePromise(true);
+  const db = SQLite.openDatabase({name: 'cartelera.db', location: 'default'}).then(async archivo => {
+    await archivo.executeSql(`CREATE TABLE IF NOT EXISTS charlas (...)`);
+    await archivo.executeSql('CREATE TABLE IF NOT EXISTS ajustes (nombre TEXT PRIMARY KEY, valor TEXT)');
+    return archivo;
+  });
+
+DESPUES:
+  import SQLite, {SQLiteDatabase} from 'react-native-sqlite-storage';
+
+  SQLite.enablePromise(true);
+  let abierta: Promise<SQLiteDatabase> | null = null;
+  function db() {
+    return abierta ??= SQLite.openDatabase({name: 'cartelera.db', location: 'default'}).then(migrar);
+  }
+
+  async function migrar(archivo: SQLiteDatabase) {
+    const [rs] = await archivo.executeSql('PRAGMA user_version');
+    const version: number = rs.rows.item(0).user_version;
+    if (version < 1) {
+      await archivo.executeSql(`CREATE TABLE IF NOT EXISTS charlas (
+        id TEXT PRIMARY KEY, title TEXT, track TEXT, day INTEGER, time TEXT,
+        room TEXT, speaker TEXT, summary TEXT, favorita INTEGER DEFAULT 0)`);
+      await archivo.executeSql('CREATE TABLE IF NOT EXISTS ajustes (nombre TEXT PRIMARY KEY, valor TEXT)');
+      await archivo.executeSql(`INSERT OR IGNORE INTO ajustes
+        SELECT 'edicion','si' WHERE EXISTS (SELECT 1 FROM charlas)`);
+      await archivo.executeSql('PRAGMA user_version = 1');
+    }
+    return archivo;
+  }
+
+  NOTA: en el resto del archivo, cada "(await db)" pasa a ser "(await db())".
+
+
+--- A1 + A2 + A4 + D9 + B4: guardar la instantanea completa ---
+
+ANTES:
+  export async function guardar(fichas: Ficha[]) {
+    const archivo = await db;
+    await archivo.transaction(tx => {
+      for (const f of fichas) {
+        tx.executeSql('INSERT OR REPLACE INTO charlas VALUES (?,?,?,?,?,?,?,?,0)',
+          [f.id,f.title,f.track,f.day,f.time,f.room,f.speaker,f.summary]);
+      }
+    });
+  }
+
+DESPUES:
+  export async function guardar(fichas: Ficha[]) {
+    const archivo = await db();
+    await archivo.transaction(tx => {
+      const ids = fichas.map(f => f.id);
+      tx.executeSql(ids.length
+        ? `DELETE FROM charlas WHERE id NOT IN (${ids.map(() => '?').join(',')})`
+        : 'DELETE FROM charlas', ids);
+      for (const f of fichas) {
+        tx.executeSql('UPDATE charlas SET title=?,track=?,day=?,time=?,room=?,speaker=?,summary=? WHERE id=?',
+          [f.title,f.track,f.day,f.time,f.room,f.speaker,f.summary,f.id]);
+        tx.executeSql(`INSERT OR IGNORE INTO charlas (id,title,track,day,time,room,speaker,summary)
+          VALUES (?,?,?,?,?,?,?,?)`, [f.id,f.title,f.track,f.day,f.time,f.room,f.speaker,f.summary]);
+      }
+      tx.executeSql("INSERT OR REPLACE INTO ajustes VALUES ('edicion','si')");
+    });
+    cacheAjustes.set('edicion', 'si');
+  }
+
+  export async function hayEdicion() {
+    return (await ajuste('edicion', 'no')) === 'si';
+  }
+
+
+--- D6: marcar con valor explicito (idempotente, para la actualizacion optimista) ---
+
+ANTES:
+  export async function alternar(id: string) {
+    await (await db).executeSql('UPDATE charlas SET favorita = 1 - favorita WHERE id = ?', [id]);
+  }
+
+DESPUES:
+  export async function fijarFavorita(id: string, favorita: 0 | 1) {
+    await (await db()).executeSql('UPDATE charlas SET favorita = ? WHERE id = ?', [favorita, id]);
+  }
+
+
+--- D8: cache en memoria de los ajustes ---
+
+ANTES:
+  export async function ajuste(nombre: string, defecto: string): Promise<string> {
+    const [rs] = await (await db).executeSql('SELECT valor FROM ajustes WHERE nombre = ?', [nombre]);
+    return rs.rows.length ? rs.rows.item(0).valor : defecto;
+  }
+  export async function configurar(nombre: string, valor: string) {
+    await (await db).executeSql('INSERT OR REPLACE INTO ajustes VALUES (?,?)', [nombre,valor]);
+  }
+
+DESPUES:
+  const cacheAjustes = new Map<string, string>();
+
+  export async function ajuste(nombre: string, defecto: string): Promise<string> {
+    const enMemoria = cacheAjustes.get(nombre);
+    if (enMemoria !== undefined) return enMemoria;
+    const [rs] = await (await db()).executeSql('SELECT valor FROM ajustes WHERE nombre = ?', [nombre]);
+    if (!rs.rows.length) return defecto;
+    const valor: string = rs.rows.item(0).valor;
+    cacheAjustes.set(nombre, valor);
+    return valor;
+  }
+  export async function configurar(nombre: string, valor: string) {
+    await (await db()).executeSql('INSERT OR REPLACE INTO ajustes VALUES (?,?)', [nombre, valor]);
+    cacheAjustes.set(nombre, valor);
+  }
+
+  export async function limpiarVistas(actual: string) {
+    await (await db()).executeSql("DELETE FROM ajustes WHERE nombre LIKE 'vista:%' AND nombre <> ?", [actual]);
+  }
+
+
+====================================================================
+src/data/AgendaRepository.ts   (A3, A4, D6)
+====================================================================
+
+ANTES:
+  import {api} from '../lab/servicio';
+  import {alternar, Ficha, guardar, listar} from './archivo';
+
+  export const agendaRepository = {
+    listar,
+    alternar,
+    async sincronizar() {
+      const respuesta = await api.get<Ficha[]>('/programa');
+      await guardar(respuesta.data);
+    },
+  };
+
+DESPUES:
+  import {api} from '../lab/servicio';
+  import {fijarFavorita, guardar, hayEdicion, listar} from './archivo';
+   import type {Ficha} from './archivo';
+
+  export class DatosInvalidos extends Error {}
+
+  function validar(data: unknown): Ficha[] {
+    if (!Array.isArray(data)) throw new DatosInvalidos('El programa no es una lista');
+    for (const f of data) {
+      if (typeof f?.id !== 'string' || typeof f?.title !== 'string' || typeof f?.day !== 'number') {
+        throw new DatosInvalidos('Charla incompleta: ' + JSON.stringify(f));
+      }
+    }
+    return data;
+  }
+
+  export const agendaRepository = {
+    listar,
+    fijarFavorita,
+    hayEdicion,
+    async sincronizar() {
+      const respuesta = await api.get<unknown>('/programa');
+      await guardar(validar(respuesta.data));
+    },
+  };
+
+
+====================================================================
+src/ui/programaModel.ts   (B1, B2, B3, C1, C2, C4, C5, D1, D3, D6, D7)
+====================================================================
+Archivo completo DESPUES:
+
+  import {useSyncExternalStore} from 'react';
+  import {agendaRepository as repo, DatosInvalidos} from '../data/AgendaRepository';
+  import {ajuste, configurar, limpiarVistas} from '../data/archivo';
+   import type {Charla} from '../data/archivo';
+
+  type Vista = {seccion: string; id: string | null; dia: number; tema: string};
+  type Estado = Vista & {charlas: Charla[]; cargando: boolean; aviso: string; sinDatos: boolean};
+
+  const VISTA_INICIAL: Vista = {seccion: 'Programa', id: null, dia: 0, tema: 'Todos'};
+  let estado: Estado = {...VISTA_INICIAL, charlas: [], cargando: false, aviso: '', sinDatos: false};
+  const observadores = new Set<() => void>();
+  let claveVista = '';
+
+  function notificar() {
+    observadores.forEach(fn => fn());
+  }
+  function publicar(cambios: Partial<Estado>) {
+    const claves = Object.keys(cambios) as (keyof Estado)[];
+    if (claves.every(k => estado[k] === cambios[k])) return;
+    estado = {...estado, ...cambios};
+    notificar();
+    if (claveVista && claves.some(k => k in VISTA_INICIAL)) {
+      const {seccion, id, dia, tema} = estado;
+      void configurar(claveVista, JSON.stringify({seccion, id, dia, tema}));
+    }
+  }
+  function suscribir(fn: () => void) {
+    observadores.add(fn);
+    return () => { observadores.delete(fn); };
+  }
+
+  export function usePrograma<T>(selector: (e: Estado) => T): T {
+    return useSyncExternalStore(suscribir, () => selector(estado));
+  }
+
+  export async function iniciarVista(taskKey: string) {
+    claveVista = 'vista:' + taskKey;
+    const guardada = await ajuste(claveVista, '');
+    estado = {...estado, ...VISTA_INICIAL, ...(guardada ? JSON.parse(guardada) : {})};
+    notificar();
+    void limpiarVistas(claveVista);
+  }
+
+  export const elegirDia = (dia: number) => publicar({dia});
+  export const elegirTema = (tema: string) => publicar({tema});
+  export const irA = (seccion: string) => publicar({seccion});
+  export const abrirFicha = (id: string) => publicar({id});
+  export const cerrarFicha = () => publicar({id: null});
+
+  let enCurso: Promise<void> | null = null;
+  let cacheLeida = false;
+  let cargaAutomaticaHecha = false;
+
+  let otraPendiente = false;
+  const marcasPendientes = new Map<string, 0 | 1>();
+  const conPendientes = (cs: Charla[]) => marcasPendientes.size
+    ? cs.map(c => marcasPendientes.has(c.id) ? {...c, favorita: marcasPendientes.get(c.id)!} : c)
+    : cs;
+
+  export function cargaInicial() {
+    if (cargaAutomaticaHecha) return;
+    cargaAutomaticaHecha = true;
+    void recargar();
+  }
+
+  export function recargar(): Promise<void> {
+    if (enCurso) { otraPendiente = true; return enCurso; }
+    enCurso = (async () => {
+      publicar({cargando: true});
+      do {
+        otraPendiente = false;
+        await unaPeticion();
+      } while (otraPendiente);
+      publicar({cargando: false});
+    })().finally(() => { enCurso = null; });
+    return enCurso;
+  }
+
+  async function unaPeticion() {
+    try {
+      if (!cacheLeida) {
+        publicar({charlas: conPendientes(await repo.listar())});
+        cacheLeida = true;
+      }
+      await repo.sincronizar();
+      publicar({charlas: conPendientes(await repo.listar()), aviso: '', sinDatos: false});
+    } catch (e) {
+      console.warn('[programa] fallo la sincronizacion', e);
+      const guardados = await repo.hayEdicion();
+      publicar({
+        sinDatos: !guardados,
+        aviso: e instanceof DatosInvalidos ? 'El programa recibido es invalido.'
+          : guardados ? 'Sin conexion: se estan usando datos guardados.'
+          : 'No se pudo descargar el programa.',
+      });
+    }
+  }
+
+  export async function marcar(id: string) {
+    const actual = estado.charlas.find(c => c.id === id);
+    if (!actual) return;
+    const favorita = actual.favorita === 1 ? 0 : 1;
+    publicar({charlas: estado.charlas.map(c => c.id === id ? {...c, favorita} : c)});
+    marcasPendientes.set(id, favorita);
+    try {
+      await repo.fijarFavorita(id, favorita);
+    } finally {
+      if (marcasPendientes.get(id) === favorita) marcasPendientes.delete(id);
+    }
+  }
+
+
+====================================================================
+src/ui/Catalogo.tsx   (C1, C2, D1, D2, D4, D5)
+====================================================================
+
+ANTES:
+  export function Catalogo({abrir}:{abrir:(id:string)=>void}) {
+    const {charlas,dia,aviso,cargando} = usePrograma();
+    const [tema,setTema] = useState('Todos');
+    useEffect(()=>{void recargar();},[]);
+    return <View>
+      ...
+      {aviso ? <View><Text>{aviso}</Text><Opcion texto="Reintentar" accion={recargar}/></View>
+        : <Lista fichas={charlas.filter(f=>(!dia || f.day===dia) && (tema==='Todos' || f.track===tema))} abrir={abrir}/>}
+    </View>;
+  }
+
+DESPUES:
+  import React,{useMemo} from 'react';
+  import {Text,View} from 'react-native';
+  import {elegirDia,elegirTema,recargar,usePrograma} from './programaModel';
+  import {Lista,Opcion,s} from './componentes';
+
+  const DIAS = ['Ambos días','Día 1','Día 2'];
+  const TEMAS = ['Todos','Android','Datos','Calidad'];
+  const actualizar = () => { void recargar(); };
+
+  export function Catalogo({abrir}:{abrir:(id:string)=>void}) {
+    const charlas = usePrograma(e=>e.charlas);
+    const dia = usePrograma(e=>e.dia);
+    const tema = usePrograma(e=>e.tema);
+    const cargando = usePrograma(e=>e.cargando);
+    const sinDatos = usePrograma(e=>e.sinDatos);
+
+    const visibles = useMemo(()=>charlas.filter(f=>
+      (!dia || f.day===dia) && (tema==='Todos' || f.track===tema)),[charlas,dia,tema]);
+
+    const encabezado = <View>
+      <View style={s.fila}>{DIAS.map((t,i)=>
+        <Opcion key={t} texto={t} activa={dia===i} accion={()=>elegirDia(i)}/>)}</View>
+      <View style={s.fila}>{TEMAS.map(t=>
+        <Opcion key={t} texto={t} activa={tema===t} accion={()=>elegirTema(t)}/>)}</View>
+      <Opcion texto="Actualizar" accion={actualizar}/>
+      {cargando && <Text>Consultando programa…</Text>}
+      {sinDatos && <Opcion texto="Reintentar" accion={actualizar}/>}
+    </View>;
+
+    return <Lista fichas={sinDatos ? [] : visibles} abrir={abrir} encabezado={encabezado}
+      vacio={sinDatos ? null : <Text style={s.texto}>
+        {charlas.length ? 'Ningún resultado con estos filtros.' : 'sin charlas programadas'}</Text>}/>;
+  }
+
+
+====================================================================
+src/ui/componentes.tsx   (D2, D5, E)
+====================================================================
+
+ANTES:
+  export function Opcion({texto,accion,activa=false}:...) {
+    return <Pressable ... style={[s.boton,activa && s.activo]}>
+      <Text style={{color:'#19453b'}}>{texto}</Text></Pressable>;
+  }
+  export function Lista({fichas,abrir}:{fichas:Charla[];abrir:(id:string)=>void}) {
+    return <View>{fichas.map(f=><Pressable key={f.id} onPress={()=>abrir(f.id)} style={s.tarjeta}>
+      <Text>Día {f.day} · {f.time} · {f.room}</Text><Text style={s.texto}>{f.title}</Text>
+      <Text>{f.track}{f.favorita ? ' · En mi agenda' : ''}</Text></Pressable>)}</View>;
+  }
+
+DESPUES:
+  import React,{memo,useCallback} from 'react';
+   import type {ReactElement} from 'react';
+  import {FlatList,Pressable,StyleSheet,Text,View} from 'react-native';
+  import type {Charla} from '../data/archivo';
+
+  export const s = StyleSheet.create({
+    pagina:{flex:1,backgroundColor:'#f8f7f1',padding:16},
+    cuerpo:{flex:1},
+    fila:{flexDirection:'row',flexWrap:'wrap',gap:6,marginVertical:5},
+    titulo:{fontSize:27,fontWeight:'700',color:'#183f39',marginVertical:8},
+    texto:{fontSize:16,color:'#213a36',marginVertical:4},
+    boton:{borderRadius:8,borderWidth:1,borderColor:'#457369',padding:9},
+    botonTexto:{color:'#19453b'},
+    activo:{backgroundColor:'#c5e6da'},
+    tarjeta:{backgroundColor:'white',padding:14,marginVertical:4,borderRadius:10},
+  });
+
+  export const Opcion = memo(function Opcion({texto,accion,activa=false}:
+    {texto:string;accion:()=>void;activa?:boolean}) {
+    return <Pressable accessibilityRole="button" onPress={accion} style={[s.boton,activa && s.activo]}>
+      <Text style={s.botonTexto}>{texto}</Text></Pressable>;
+  });
+
+  const Tarjeta = memo(function Tarjeta({f,abrir}:{f:Charla;abrir:(id:string)=>void}) {
+    const alTocar = useCallback(()=>abrir(f.id),[abrir,f.id]);
+    return <Pressable onPress={alTocar} style={s.tarjeta}>
+      <Text>Día {f.day} · {f.time} · {f.room}</Text>
+      <Text style={s.texto}>{f.title}</Text>
+      <Text>{f.track}{f.favorita===1 ? ' · En mi agenda' : ''}</Text>
+    </Pressable>;
+  });
+
+  const claveDe = (f:Charla)=>f.id;
+
+  export function Lista({fichas,abrir,encabezado,vacio}:{fichas:Charla[];abrir:(id:string)=>void;
+    encabezado?:ReactElement;vacio?:ReactElement|null}) {
+    const render = useCallback(({item}:{item:Charla})=><Tarjeta f={item} abrir={abrir}/>,[abrir]);
+    return <FlatList data={fichas} keyExtractor={claveDe} renderItem={render}
+      ListHeaderComponent={encabezado} ListEmptyComponent={vacio}
+      initialNumToRender={10} windowSize={5} removeClippedSubviews/>;
+  }
+
+
+====================================================================
+App.tsx   (C2, C3, C4, C5, D1, D2, D3, D4, D5)
+====================================================================
+Archivo completo DESPUES:
+
+  import React,{useEffect,useMemo,useState} from 'react';
+  import {BackHandler,ScrollView,Text,View} from 'react-native';
+  import {configurar} from './src/data/archivo';
+  import {Catalogo} from './src/ui/Catalogo';
+  import {Mesa} from './src/ui/Mesa';
+  import {Lista,Opcion,s} from './src/ui/componentes';
+  import {abrirFicha,cargaInicial,cerrarFicha,iniciarVista,irA,marcar,usePrograma} from './src/ui/programaModel';
+
+  type Inicio = {taskKey:string; offlineStart?:boolean};
+  export default function App({taskKey,offlineStart}:Inicio) {
+    const [lista,setLista] = useState(false);
+    useEffect(()=>{
+      (offlineStart ? configurar('disponible','no') : Promise.resolve())
+        .then(()=>iniciarVista(taskKey))
+        .then(()=>setLista(true));
+    },[offlineStart,taskKey]);
+    return lista ? <Portada/> : <Text>Abriendo agenda…</Text>;
+  }
+
+  const SECCIONES = ['Programa','Mi agenda','Mesa'];
+  const sinFavoritas = <Text>Todavía no agregaste charlas.</Text>;
+
+  function Portada() {
+    const seccion = usePrograma(e=>e.seccion);
+    const id = usePrograma(e=>e.id);
+    const charlas = usePrograma(e=>e.charlas);
+    const aviso = usePrograma(e=>e.aviso);
+    const ficha = useMemo(()=>charlas.find(f=>f.id===id),[charlas,id]);
+    const favoritas = useMemo(()=>charlas.filter(f=>f.favorita===1),[charlas]);
+
+    useEffect(()=>{ cargaInicial(); },[]);
+
+    useEffect(()=>{
+      const sub = BackHandler.addEventListener('hardwareBackPress',()=>{
+        if (id) { cerrarFicha(); return true; }
+        if (seccion!=='Programa') { irA('Programa'); return true; }
+        return false;
+      });
+      return ()=>sub.remove();
+    },[seccion,id]);
+
+    return <View style={s.pagina}><Text>Jornadas del Sur</Text>
+      <Text style={s.titulo}>{id?'Detalle':seccion}</Text>
+      {!!aviso && <Text style={s.texto}>{aviso}</Text>}
+      <View style={s.cuerpo}>
+        {id ? <ScrollView><Opcion texto="Volver" accion={cerrarFicha}/>
+          {ficha && <View><Text style={s.titulo}>{ficha.title}</Text><Text style={s.texto}>
+            Día {ficha.day} · {ficha.time} · {ficha.room}</Text>
+            <Text>{ficha.speaker}</Text><Text style={s.texto}>{ficha.summary}</Text>
+            <Opcion texto={ficha.favorita===1?'Quitar de mi agenda':'Agregar a mi agenda'}
+              accion={()=>marcar(ficha.id)}/>
+          </View>}</ScrollView>
+        /* C3: sin key de orientacion */
+        : seccion==='Programa' ? <Catalogo abrir={abrirFicha}/>
+        : seccion==='Mesa' ? <ScrollView><Mesa/></ScrollView>
+        : <Lista fichas={favoritas} abrir={abrirFicha} vacio={sinFavoritas}/>}
+      </View>
+      {!id && <View style={s.fila}>{SECCIONES.map(t=>
+        <Opcion key={t} texto={t} activa={seccion===t} accion={()=>irA(t)}/>)}</View>}
+    </View>;
+  }
+
+  Lineas eliminadas respecto del original:
+    App.tsx:2   AppState, useWindowDimensions (ya no se usan)
+    App.tsx:22  const {width,height} = useWindowDimensions();
+    App.tsx:26  AppState.addEventListener('change', ... recargar())     -> D1
+    App.tsx:39  <ScrollView style={{flex:1}}>                           -> D2/D5
+    App.tsx:46  key={width>height?'horizontal':'vertical'}              -> C3
+
+
+====================================================================
+src/lab/servicio.ts + src/ui/Mesa.tsx   (C7, D8)
+====================================================================
+
+servicio.ts ANTES:
+  export let solicitudes = 0;
+  ...
+    adapter: async config => {
+      solicitudes++;
+
+servicio.ts DESPUES:
+  let solicitudes = 0;
+  const observadoresContador = new Set<() => void>();
+  export function suscribirContador(fn: () => void) {
+    observadoresContador.add(fn);
+    return () => { observadoresContador.delete(fn); };
+  }
+  export const leerContador = () => solicitudes;
+  ...
+    adapter: async config => {
+      solicitudes++;
+      observadoresContador.forEach(fn => fn());
+
+Mesa.tsx ANTES:
+  import {solicitudes} from '../lab/servicio';
+  ...
+  return <View><Text style={s.texto}>Peticiones en esta sesión: {solicitudes}</Text>
+
+Mesa.tsx DESPUES:
+  import React,{useSyncExternalStore} from 'react';
+  import {leerContador,suscribirContador} from '../lab/servicio';
+  ...
+  export function Mesa() {
+    const solicitudes = useSyncExternalStore(suscribirContador, leerContador);
+    ...
+    return <View><Text style={s.texto}>Peticiones en esta sesión: {solicitudes}</Text>
+
+
+====================================================================
+android/app/src/main/java/ar/jornadasrn/MainActivity.kt   (C6)
+====================================================================
+
+ANTES:
+  override fun onCreate(savedInstanceState: Bundle?) {
+      sessionKey = savedInstanceState?.getString("sessionKey") ?: UUID.randomUUID().toString()
+      super.onCreate(savedInstanceState)
+  }
+  ...
+      putBoolean("offlineStart", intent.getBooleanExtra("sin_servicio", false))
+
+DESPUES:
+  private lateinit var sessionKey: String
+  private var restaurada = false
+
+  override fun onCreate(savedInstanceState: Bundle?) {
+      restaurada = savedInstanceState != null
+      sessionKey = savedInstanceState?.getString("sessionKey") ?: UUID.randomUUID().toString()
+      super.onCreate(savedInstanceState)
+  }
+  ...
+      putBoolean("offlineStart", !restaurada &&
+          (!intent.getBooleanExtra("servicio_disponible", true) ||
+           intent.getBooleanExtra("sin_servicio", false)))
+
+
+====================================================================
+android/gradle.properties   (D11)
+====================================================================
+
+ANTES:
+  reactNativeArchitectures=armeabi-v7a,arm64-v8a,x86,x86_64
+
+DESPUES: el archivo NO se modifica (la entrega debe compilar para todos).
+En desarrollo, compilar solo para el emulador desde la linea de comandos:
+  gradlew.bat assembleDebug -PreactNativeArchitectures=x86_64
+
+NO agregar splits { abi { ... } }: aplican tambien a debug y el APK pasa a
+llamarse app-x86_64-debug.apk en vez de app-debug.apk.
+
+
+====================================================================
+android/app/build.gradle   (D13)
+====================================================================
+
+ANTES (bloque react { }):
+  react {
+      ...
+      ...
+      autolinkLibrariesWithApp()
+  }
+
+DESPUES:
+  react {
+      ...
+      debuggableVariants = []
+      ...
+      autolinkLibrariesWithApp()
+  }
+
+
+====================================================================
+android/app/build.gradle + proguard-rules.pro   (D12)
+====================================================================
+
+build.gradle ANTES:
+  def enableProguardInReleaseBuilds = false
+DESPUES:
+  def enableProguardInReleaseBuilds = true
+
+proguard-rules.pro (agregar al final):
+  # react-native-sqlite-storage usa reflexion desde el bridge
+  -keep class org.pgsqlite.** { *; }
+
+
+====================================================================
+E. Limpieza
+====================================================================
+
+- Borrar src/legacy/agendaImpresa.ts (nadie lo importa).
+
+- android/app/src/main/res/values/strings.xml
+  ANTES:   <string name="app_name">Hello App Display Name</string>
+  DESPUES: <string name="app_name">Jornadas del Sur</string>
+
+- favorita: en toda la UI comparar con === 1 (ya aplicado en componentes.tsx y
+  App.tsx), nunca usar {f.favorita && ...}.
+
+
+
+####################################################################
+PARTE 3 - RELACION DE LOS CAMBIOS CON EL README
+####################################################################
+
+41 - Programa sin senal
+  - Conservacion de lista, detalle y favoritas ante una falla ............. C1, A4
+  - Informa que se estan usando datos guardados (en todas las pantallas)  C1
+  - Sin descarga previa ofrece reintento ................................ C1 (sinDatos)
+  - v4 exitosa muestra «sin charlas programadas» ........................ C1
+  - v4 sigue siendo edicion valida al reabrir sin senal ................. A4 (flag 'edicion')
+  - Arranque sin senal con --ez servicio_disponible false ............... C6
+
+42 - Agenda personal
+  - v1 -> v2: la 11 conserva marca, titulo y sala nuevos ................ A1 (UPDATE)
+  - v3: la 11 sale del catalogo y de Mi agenda, entra la 90 ............. A2 (DELETE NOT IN)
+  - Se conservan las marcas de las charlas vigentes ..................... A1
+  - Retirada y vuelve -> vuelve sin marcar .............................. A2 (fila borrada)
+  - Marca cambiada durante una peticion se respeta ...................... A1 + B4
+
+43 - Volver al punto de lectura
+  - Dia 2 + Datos, abrir ficha, volver y rotar -> 2 resultados .......... C2 + C3
+  - Ficha abierta + app al fondo -> sin cambios ni recarga .............. D1
+  - Proceso muerto -> recupera ficha y, al volver, ambos filtros ........ C4 (vista:<taskKey>)
+  - Tarea nueva arranca sin filtros ..................................... C5
+
+44 - Control de descargas
+  - Una carga automatica por proceso .................................... D1 (cargaInicial)
+  - Una por actualizacion explicita ..................................... B1
+  - Rotar / entrar a ficha / cambiar de pestana agrega cero .............. C3 + D1
+  - Dos toques durante una peticion agregan un intento .................. B1 (otraPendiente)
+  - Tras exito o falla se puede volver a pedir .......................... B1 (enCurso = null)
+  - Filtros editables durante la espera ................................. C2 (store)
+
+Conservar datos del usuario al actualizar
+  - Misma base (cartelera.db), mismas tablas, migracion no destructiva ... A5
+  - Para comprobarlo, instalar encima con adb install -r, sin desinstalar,
+    manteniendo la firma original.
+
+
+
+
+####################################################################
+PARTE 4 - EXPLICACION DE LAS CORRECCIONES
+####################################################################
+
+
+41 - PROGRAMA SIN SEÑAL
+=======================
+
+"Con una edición previa, una falla conserva lista, detalle y favoritas"
+  Antes, cuando se caía la red, el catálogo cambiaba la lista por el cartel de
+  error y listo: te quedabas sin nada aunque tuvieras todo guardado en el
+  teléfono. Ahora el error no reemplaza la lista: se muestra el aviso arriba y
+  abajo sigue estando todo lo que tenías. Como los datos salen de SQLite y no de
+  la respuesta, el detalle y las favoritas siguen ahí, tranquilos.
+
+"Informa que se están usando datos guardados"
+  El cartel de "Sin conexión: se están usando datos guardados" ahora vive en la
+  pantalla principal (Portada), debajo del título. Así lo ves estés donde estés:
+  en el catálogo, en Mi agenda o con una ficha abierta. Antes solo aparecía en el
+  catálogo, y si estabas leyendo una charla ni te enterabas.
+
+"Sin descarga previa debe ofrecer reintento"
+  Acá el truco es saber si alguna vez bajaste el programa. No alcanza con mirar
+  si la lista está vacía, porque un programa vacío también es válido (la v4).
+  Entonces, cada vez que una descarga sale bien, guardamos un ajuste "edicion" =
+  "si". Si falla y ese ajuste no existe, es que nunca tuviste nada: mostramos el
+  botón "Reintentar". Para los usuarios que ya tenían la app instalada con
+  charlas, la migración pone ese ajuste solita, así no los tratamos como nuevos.
+
+"Una v4 exitosa muestra «sin charlas programadas»"
+  Si la descarga sale bien pero viene vacía, la lista queda vacía y se muestra
+  el texto «sin charlas programadas», tal cual lo pide el enunciado. Ojo que no
+  es lo mismo que "ningún resultado con estos filtros": ese aparece cuando hay
+  charlas pero tus filtros las esconden todas.
+
+"Sigue siendo una edición válida al reabrir sin señal"
+  Como la v4 salió bien, quedó guardado el ajuste "edicion". Si cerrás la app y
+  la abrís sin red, la descarga falla, pero el código ve que hay una edición
+  guardada: te avisa que usa datos guardados y te muestra «sin charlas
+  programadas», no el botón de reintento como si nunca hubieras bajado nada.
+
+"Arranque vacío sin señal (--ez servicio_disponible false)"
+  El comando del enunciado manda el extra "servicio_disponible", pero la
+  Activity leía otro distinto ("sin_servicio", y encima al revés). O sea, el
+  modo sin señal nunca se activaba. Ahora se lee "servicio_disponible" (y se
+  sigue aceptando el viejo por las dudas). Además solo se aplica cuando la app
+  arranca de cero: si Android te restaura la tarea, no te vuelve a apagar el
+  servicio por un intent viejo.
+
+
+42 - AGENDA PERSONAL
+====================
+
+"De v1 a v2, la 11 conserva su marca pero muestra el título y la sala nuevos"
+  El bug grande estaba acá. Se guardaba con INSERT OR REPLACE, y en SQLite eso
+  borra la fila y la vuelve a crear, con favorita en 0. Resultado: cada vez que
+  se actualizaba el programa, tu agenda quedaba vacía. Ahora por cada charla se
+  hace un UPDATE de los datos del programa (título, sala, horario, etc.) sin
+  tocar la columna favorita, y después un INSERT OR IGNORE para las que son
+  nuevas. La 11 actualiza título y sala y su marca queda como estaba.
+  Detalle técnico: no usamos UPSERT (ON CONFLICT DO UPDATE) porque Android 8
+  trae SQLite 3.18 y UPSERT recién existe desde la 3.24. Ahí se rompía todo.
+
+"En v3 desaparece la 11 del catálogo y de Mi agenda y entra la 90"
+  El servidor manda siempre el programa completo. Entonces, lo que no vino es
+  porque se retiró. Antes de actualizar se hace un DELETE de todas las charlas
+  cuyo id no está en la respuesta (o se borra todo si vino vacía). La 11 se va
+  de la base, y como Mi agenda sale de la misma tabla, se va de los dos lados.
+  La 90 entra por el INSERT OR IGNORE.
+
+"Se conservan las marcas de las charlas vigentes"
+  Sale gratis con lo anterior: a las que siguen solo se les hace UPDATE de los
+  datos del programa, nunca se toca su marca.
+
+"Si una charla se retira y después regresa, regresa sin marcar"
+  Como a la retirada la borramos de verdad (no la escondemos), cuando vuelve
+  entra como una fila nueva, con favorita en 0. Sin código extra.
+
+"Una marca agregada o quitada durante una petición debe respetarse"
+  En la base ya está cubierto: la respuesta nunca escribe la columna favorita,
+  así que si marcaste algo mientras se descargaba, eso queda. En la pantalla
+  había un huequito: si justo el "releer la lista" de la descarga corría antes
+  de que se guardara tu marca, te la mostraba vieja. Lo tapamos con un mapa de
+  "marcas pendientes": mientras tu marca no se escribió, cualquier lista que
+  llegue se corrige con lo que vos tocaste. Cuando se guarda, se saca del mapa.
+  El borrado y las actualizaciones van en una sola transacción, así que nunca
+  se ve un estado a medias.
+
+
+43 - VOLVER AL PUNTO DE LECTURA
+===============================
+
+"Elegí Día 2 y Datos, abrí una ficha, volvé y rotá: deben quedar dos resultados"
+  Había dos problemas. El filtro de tema era estado local del Catálogo, y el
+  Catálogo se desmontaba al abrir una ficha, así que al volver estaba otra vez
+  en "Todos". Y encima tenía un key que dependía de la orientación: al rotar,
+  React lo tiraba y lo armaba de nuevo, perdiendo el filtro (y de paso bajando
+  el programa otra vez). Solución: el tema pasó al store, igual que el día, y
+  se sacó el key de la orientación. La Activity ya maneja la rotación sola
+  (configChanges), no hacía falta ese truco.
+
+"Repetí dejando la ficha abierta y mandando la app al fondo"
+  Mandar la app al fondo no mata nada: el estado sigue en memoria. Lo que había
+  que sacar era el listener de AppState que recargaba el programa cada vez que
+  volvías. Ahora volvés y está todo igual, sin descargas de más.
+
+"Si Android mata el proceso y recupera la tarea, debe recuperar la ficha y los filtros"
+  Cuando Android mata el proceso se pierde toda la memoria del JS. Pero la
+  MainActivity ya generaba un taskKey (un UUID) y lo guardaba en
+  savedInstanceState: si Android restaura la tarea, te devuelve el mismo
+  taskKey. El JS lo recibía y no lo usaba. Ahora cada vez que cambia la sección,
+  la ficha abierta, el día o el tema, se guarda en SQLite bajo "vista:<taskKey>".
+  Al arrancar, si hay algo guardado para ese taskKey, se restaura: volvés a la
+  ficha, y al tocar "Volver" están los dos filtros.
+
+"Una tarea nueva arranca sin filtros"
+  Una tarea nueva trae un UUID nuevo, así que no hay nada guardado con esa clave
+  y arranca limpia. Ojo con un detalle: si el proceso seguía vivo, el estado en
+  memoria tenía los filtros viejos y la tarea nueva los heredaba. Por eso, al
+  iniciar, la vista se resetea a los valores por defecto antes de aplicar lo que
+  haya guardado. De paso se borran las vistas de tareas viejas para no juntar
+  basura.
+
+
+44 - CONTROL DE DESCARGAS
+=========================
+
+"Una carga automática por sesión (proceso)"
+  Había tres lugares que bajaban el programa solos: cuando montaba la Portada,
+  cuando montaba el Catálogo (que pasaba cada vez que rotabas, abrías una ficha
+  o cambiabas de pestaña) y cada vez que la app volvía del fondo. Solo al abrir
+  ya se hacían dos peticiones. Ahora hay una función cargaInicial() con una
+  bandera a nivel de módulo: la primera vez descarga, las demás no hace nada.
+  Como la bandera vive en memoria, cuando muere el proceso se resetea y la
+  sesión nueva tiene su carga automática.
+
+"Y una por actualización explícita"
+  El botón "Actualizar" (o "Reintentar") llama a recargar(), que hace su
+  petición. Nada de raro.
+
+"Rotar, entrar a una ficha o cambiar de pestaña agrega cero"
+  Sale de sacar el useEffect del Catálogo, el key de orientación y el listener
+  de AppState. Ninguna de esas acciones dispara una descarga ahora.
+
+"Dos toques durante una petición agregan un intento"
+  Antes cada toque lanzaba otra petición, y si una vieja y lenta llegaba
+  después de una nueva, te pisaba el programa con datos viejos. Ahora hay una
+  sola petición a la vez. Si tocás mientras hay una en curso, se anota que hace
+  falta "una más" (no importa si tocaste dos o diez veces). Cuando termina la
+  actual, se lanza esa una más. La ventaja extra es que esa petición nueva
+  captura la edición y disponibilidad del momento: si cambiaste algo en Mesa
+  mientras esperabas, se usa lo nuevo.
+
+"Tras éxito o falla se puede volver a pedir"
+  Cuando termina la petición (bien o mal) se libera la promesa en curso
+  (enCurso = null), así que el próximo toque arranca una petición nueva. El
+  cartel de "Consultando programa…" también se apaga recién cuando terminó
+  todo, no cuando termina la primera de varias.
+
+"Los filtros siguen siendo editables durante la espera"
+  Los filtros están en el store y no dependen de que la descarga termine. El
+  aviso de carga solo agrega un texto: podés tocar días y temas mientras tanto
+  y la lista se filtra al toque con lo que haya.
+
+
+CONSERVAR LOS DATOS DEL USUARIO AL ACTUALIZAR
+=============================================
+  La versión instalada ya tiene gente con charlas guardadas, así que no se toca
+  el nombre de la base (cartelera.db), ni las tablas, ni el applicationId (si
+  lo cambiás, para Android es otra app y el usuario arranca de cero). Para el
+  futuro se agregó control de versiones del esquema con PRAGMA user_version:
+  cada cambio se aplica una sola vez y sin borrar nada. Para probar, se instala
+  encima con "adb install -r" firmado con el mismo debug.keystore, sin
+  desinstalar antes.
